@@ -40,11 +40,13 @@ class VLLM_Detector(EngineDetector):
         # (HND) or BS/NH (NHD) -- indistinguishable from the shape alone, so the
         # resolved kv_layout decides. Split [NB, *, *, 2*HS] into
         # [NB, *, *, 2, HS].
+        # Every layer must be rank-4: hybrid models mix this with other ranks
+        # (e.g. a rank-3 key-only indexer), which the split below cannot handle.
+        # Declining lets the caller fall back to per-shape detection.
         if (
             isinstance(kv_caches, list)
             and kv_caches
-            and isinstance(kv_caches[0], torch.Tensor)
-            and kv_caches[0].dim() == 4
+            and all(isinstance(t, torch.Tensor) and t.dim() == 4 for t in kv_caches)
         ):
             fused_dim = kv_caches[0].shape[3]
             if fused_dim % 2 != 0:
