@@ -243,6 +243,21 @@ class StorageManagerConfig:
     prefetch_policy: str = "default"
     """ The L2 prefetch policy name. """
 
+    store_min_hits: int = 2
+    """ Minimum estimated access count before a frequency-gated store policy
+    admits a key to L2. Only used by frequency-gated store policies. """
+
+    frequency_sketch_width: int = 1 << 18
+    """ Counters per Count-Min Sketch row for frequency-gated policies. """
+
+    frequency_sketch_depth: int = 6
+    """ Number of Count-Min Sketch rows for frequency-gated policies. """
+
+    frequency_aging_interval_seconds: float = 0.0
+    """ Wall-clock period after which the Count-Min Sketch halves every
+    counter, so frequency-gated policies track recent instead of all-time
+    frequency. 0 disables aging. """
+
     prefetch_max_in_flight: int = 8
     """ Maximum number of concurrent prefetch requests. """
 
@@ -289,6 +304,22 @@ def validate_storage_manager_config(config: StorageManagerConfig) -> None:
         ValueError: If mutually exclusive L1 tiers are both configured, or
             hybrid L1 is paired with incompatible L2 adapters.
     """
+    if config.store_min_hits < 1:
+        raise ValueError(f"store_min_hits must be >= 1 (got {config.store_min_hits})")
+    if config.frequency_sketch_width < 1:
+        raise ValueError(
+            f"frequency_sketch_width must be >= 1 (got {config.frequency_sketch_width})"
+        )
+    if config.frequency_sketch_depth < 1:
+        raise ValueError(
+            f"frequency_sketch_depth must be >= 1 (got {config.frequency_sketch_depth})"
+        )
+    if config.frequency_aging_interval_seconds < 0:
+        raise ValueError(
+            "frequency_aging_interval_seconds must be >= 0 "
+            f"(got {config.frequency_aging_interval_seconds})"
+        )
+
     if (
         config.l1_manager_config.gds_l1_config is not None
         and config.l1_manager_config.memory_config.devdax_path
@@ -500,6 +531,35 @@ def add_storage_manager_args(
         "Default is 'default' (pick the first adapter by index).",
     )
     policy_group.add_argument(
+        "--l2-store-min-hits",
+        type=int,
+        default=2,
+        help="Minimum estimated access count before a frequency-gated store "
+        "policy (e.g. 'gated_store') admits a key to L2. Default is 2.",
+    )
+    policy_group.add_argument(
+        "--l2-frequency-sketch-width",
+        type=int,
+        default=1 << 18,
+        help="Counters per Count-Min Sketch row used by frequency-gated "
+        "policies. Default is 262144.",
+    )
+    policy_group.add_argument(
+        "--l2-frequency-sketch-depth",
+        type=int,
+        default=6,
+        help="Number of Count-Min Sketch rows used by frequency-gated "
+        "policies. Default is 6.",
+    )
+    policy_group.add_argument(
+        "--l2-frequency-aging-interval-seconds",
+        type=float,
+        default=0.0,
+        help="Wall-clock period after which frequency-gated policies halve "
+        "every Count-Min Sketch counter, tracking recent instead of all-time "
+        "frequency. 0 disables aging. Default is 0.",
+    )
+    policy_group.add_argument(
         "--l2-prefetch-max-in-flight",
         type=int,
         default=8,
@@ -596,6 +656,10 @@ def parse_args_to_config(
         l2_adapter_config=l2_adapter_config,
         store_policy=args.l2_store_policy,
         prefetch_policy=args.l2_prefetch_policy,
+        store_min_hits=args.l2_store_min_hits,
+        frequency_sketch_width=args.l2_frequency_sketch_width,
+        frequency_sketch_depth=args.l2_frequency_sketch_depth,
+        frequency_aging_interval_seconds=args.l2_frequency_aging_interval_seconds,
         prefetch_max_in_flight=args.l2_prefetch_max_in_flight,
         periodic_notifier_interval_ms=args.periodic_notifier_interval_ms,
     )

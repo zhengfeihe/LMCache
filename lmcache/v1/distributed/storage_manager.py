@@ -39,12 +39,18 @@ from lmcache.v1.distributed.storage_controllers import (
     PrefetchController,
     StoreController,
 )
+from lmcache.v1.distributed.storage_controllers.frequency import (
+    FrequencyConfig,
+    CountMinSketch,
+    FrequencyTrackingListener,
+)
 from lmcache.v1.distributed.storage_controllers.prefetch_policy import (
     create_prefetch_policy,
 )
 from lmcache.v1.distributed.storage_controllers.store_policy import (
     AdapterDescriptor,
     create_store_policy,
+    store_policy_uses_frequency,
 )
 from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.mp_observability.event import Event, EventType
@@ -129,6 +135,12 @@ class StorageManager:
         )
         self._l2_eviction_controller.start()
 
+        # Build the frequency estimator used by the frequency-gated store
+        # policy. Only allocate the sketch and register the L1-access listener
+        # when such a policy is selected, so default deployments keep their
+        # behavior and pay no extra memory.
+        self._frequency_estimator = self._build_frequency_estimator(config)
+
         # Controllers receive the initial set as ordered lists; they key
         # their own copies by ``descriptor.index`` (== adapter_id) and learn
         # of later changes via add_adapter/request_remove_adapter.
@@ -136,7 +148,11 @@ class StorageManager:
             l1_manager=self._l1_manager,
             l2_adapters=list(self._l2_adapters.values()),
             adapter_descriptors=list(self._adapter_descriptors.values()),
-            policy=create_store_policy(config.store_policy),
+            policy=create_store_policy(
+                config.store_policy,
+                estimator=self._frequency_estimator,
+                min_hits=config.store_min_hits,
+            ),
         )
         self._store_controller.start()
 
@@ -161,6 +177,37 @@ class StorageManager:
             ),
             self.get_l2_usages,
         )
+
+    def _build_frequency_estimator(
+        self, config: StorageManagerConfig
+    ) -> CountMinSketch | None:
+        """Build the access-frequency estimator for the frequency-gated store
+        policy.
+
+        Returns a :class:`CountMinSketch` and registers a
+        :class:`FrequencyTrackingListener` on the L1 manager when the store
+        policy is frequency-gated. Otherwise returns ``None`` and registers
+        nothing, so default deployments allocate no sketch and add no listener.
+
+        Args:
+            config: The storage manager configuration.
+
+        Returns:
+            The estimator to hand to the store policy, or ``None`` when the
+            selected store policy is not frequency-gated.
+        """
+        if not store_policy_uses_frequency(config.store_policy):
+            return None
+
+        estimator = CountMinSketch(
+            FrequencyConfig(
+                width=config.frequency_sketch_width,
+                depth=config.frequency_sketch_depth,
+                aging_interval_seconds=config.frequency_aging_interval_seconds,
+            )
+        )
+        self._l1_manager.register_listener(FrequencyTrackingListener(estimator))
+        return estimator
 
     # External APIs for serving engine integration code to call
     @enable_tracing()

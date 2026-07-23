@@ -17,6 +17,9 @@ from lmcache.v1.distributed.l2_adapters.config import (
     L2AdapterConfigBase,
     get_type_name_for_config,
 )
+from lmcache.v1.distributed.storage_controllers.frequency import (
+    CountMinSketch,
+)
 
 
 @dataclass(frozen=True)
@@ -55,6 +58,11 @@ class StorePolicy(ABC):
     2. Which keys to delete from L1 after successful L2 store
        (select_l1_deletions).
     """
+
+    uses_frequency_estimator: bool = False
+    """Whether this policy is constructed with an access-frequency estimator
+    and a ``min_hits`` threshold. Subclasses that gate on frequency override
+    this to ``True``; the factory reads it to decide what to pass."""
 
     @abstractmethod
     def select_store_targets(
@@ -122,15 +130,17 @@ def get_registered_store_policies() -> list[str]:
     return list(_STORE_POLICY_REGISTRY)
 
 
-def create_store_policy(name: str) -> StorePolicy:
-    """
-    Create a store policy instance by name.
+def store_policy_uses_frequency(name: str) -> bool:
+    """Return whether the named store policy consults a frequency estimator.
+
+    Used by the storage manager to decide whether to build and feed a
+    frequency estimator.
 
     Args:
         name: Registered policy name.
 
     Returns:
-        A new StorePolicy instance.
+        ``True`` if the policy declares ``uses_frequency_estimator``.
 
     Raises:
         ValueError: If no policy is registered under the given name.
@@ -138,7 +148,44 @@ def create_store_policy(name: str) -> StorePolicy:
     if name not in _STORE_POLICY_REGISTRY:
         known = ", ".join(sorted(_STORE_POLICY_REGISTRY)) or "(none)"
         raise ValueError(f"Unknown store policy {name!r}. Known: {known}")
-    return _STORE_POLICY_REGISTRY[name]()
+    return _STORE_POLICY_REGISTRY[name].uses_frequency_estimator
+
+
+def create_store_policy(
+    name: str,
+    estimator: CountMinSketch | None,
+    min_hits: int,
+) -> StorePolicy:
+    """
+    Create a store policy instance by name.
+
+    Frequency-gated policies receive ``estimator`` and ``min_hits``; all
+    other policies ignore both and are constructed with no arguments.
+
+    Args:
+        name: Registered policy name.
+        estimator: Frequency estimator for frequency-gated policies, or
+            ``None`` when no frequency-gated policy is in use.
+        min_hits: Minimum estimated access count a key must reach before a
+            frequency-gated policy admits it to L2. Ignored by other
+            policies.
+
+    Returns:
+        A new StorePolicy instance.
+
+    Raises:
+        ValueError: If no policy is registered under the given name, or a
+            frequency-gated policy is requested without an estimator.
+    """
+    if name not in _STORE_POLICY_REGISTRY:
+        known = ", ".join(sorted(_STORE_POLICY_REGISTRY)) or "(none)"
+        raise ValueError(f"Unknown store policy {name!r}. Known: {known}")
+    policy_cls = _STORE_POLICY_REGISTRY[name]
+    if policy_cls.uses_frequency_estimator:
+        if estimator is None:
+            raise ValueError(f"Store policy {name!r} requires a frequency estimator")
+        return policy_cls(estimator=estimator, min_hits=min_hits)
+    return policy_cls()
 
 
 class DefaultStorePolicy(StorePolicy):
@@ -209,5 +256,71 @@ class BufferOnlyStorePolicy(DefaultStorePolicy):
         return list(keys)
 
 
+class GatedStorePolicy(StorePolicy):
+    """Store policy that admits a key to L2 only after enough accesses.
+
+    A key is stored to every adapter once its estimated access count
+    reaches ``min_hits``; keys below the threshold are skipped, trading an
+    extra recompute (if they are later requested and missing) for reduced
+    L2 write amplification. Never deletes from L1.
+
+    This intentionally violates the project's "loading is cheaper than
+    recomputing" default, so it is opt-in and only worthwhile when the L2
+    tier is I/O-bound on writes that are rarely read back.
+
+    Args:
+        estimator: Frequency estimator queried for per-key access counts.
+        min_hits: Minimum estimated access count a key must reach to be
+            admitted to L2. Must be >= 1.
+
+    Raises:
+        ValueError: If ``min_hits`` is less than 1.
+    """
+
+    uses_frequency_estimator = True
+
+    def __init__(self, estimator: CountMinSketch, min_hits: int) -> None:
+        if min_hits < 1:
+            raise ValueError(f"min_hits must be >= 1 (got {min_hits})")
+        self._estimator = estimator
+        self._min_hits = min_hits
+
+    def select_store_targets(
+        self,
+        keys: list[ObjectKey],
+        adapters: list[AdapterDescriptor],
+    ) -> dict[int, list[ObjectKey]]:
+        """Store only keys whose estimated access count reaches the threshold.
+
+        Args:
+            keys: Keys that were just written to L1.
+            adapters: Descriptors of available L2 adapters.
+
+        Returns:
+            Mapping from every adapter index to the subset of ``keys`` whose
+            estimate is at least ``min_hits``. Adapters always receive the
+            same admitted subset.
+        """
+        admitted = [
+            key for key in keys if self._estimator.estimate(key) >= self._min_hits
+        ]
+        return {ad.index: list(admitted) for ad in adapters}
+
+    def select_l1_deletions(
+        self,
+        keys: list[ObjectKey],
+    ) -> list[ObjectKey]:
+        """Never delete from L1.
+
+        Args:
+            keys: Keys that were successfully stored to L2.
+
+        Returns:
+            Empty list (keep all keys in L1).
+        """
+        return []
+
+
 register_store_policy("default", DefaultStorePolicy)
 register_store_policy("skip_l1", BufferOnlyStorePolicy)
+register_store_policy("gated_store", GatedStorePolicy)
