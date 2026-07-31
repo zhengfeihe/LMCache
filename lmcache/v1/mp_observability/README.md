@@ -63,6 +63,7 @@ CLI, pass the flags below; when embedding programmatically, construct an
 | `--enable-gc-monitor` | off | Time every CPython garbage collection and log the slow ones at INFO. Logs directly rather than publishing events, so it is independent of every other flag in this table. |
 | `--gc-monitor-min-pause-ms MS` | `1.0` | Only log collections that took at least this long. `0` logs every collection, including the very frequent sub-millisecond gen-0 sweeps. |
 | `--gc-monitor-top-objects N` | `0` | Append the N most common object types in the collected generation. Walks the whole generation on **every** collection (O(heap)) — debugging only. |
+| `--gc-monitor-top-cycles N` | `0` | Append the N most common object types among the cyclic garbage each collection actually freed (`cycle:type=count`), identifying the code that creates reference cycles. Runs the collector with `gc.DEBUG_SAVEALL`; cost is O(garbage freed), not O(heap), so it is cheap enough for long runs. |
 | `--enable-extra-logging` | off | Periodically log per-GPU L0<->L1 store/retrieve throughput and token counts, plus L1 memory usage (from the eviction loop), at INFO. **Conflicts with `--disable-observability`.** |
 | `--extra-logging-interval SECONDS` | `10.0` | Seconds between extra-logging emissions. Values below 1.0 are limited by the 1 Hz internal heartbeat. |
 

@@ -5,7 +5,9 @@
 A full (generation-2) collection is stop-the-world and walks the whole heap,
 so it lands inside store/retrieve handling as tail latency that nothing else
 in the server accounts for.  :class:`GCMonitor` times every collection via a
-``gc.callbacks`` hook and logs the slow ones.
+``gc.callbacks`` hook and logs the slow ones.  Optional cycle diagnostics
+(``top_cycles``) additionally classify the cyclic garbage each collection
+freed, pointing at the code that creates reference cycles.
 
 The monitor logs directly rather than publishing to the EventBus: the hook
 runs inside the collector, on whichever thread triggered it, so it does the
@@ -41,17 +43,27 @@ class GCMonitorConfig:
         top_objects: When positive, log a breakdown of the ``N`` most common
             object types in the generation being collected.  Walks the whole
             generation on *every* collection (O(heap)) -- debugging only.
+        top_cycles: When positive, run the collector with
+            ``gc.DEBUG_SAVEALL`` and log the ``N`` most common object types
+            among the cyclic garbage each collection actually freed, as
+            ``cycle:<module>.<type>=<count>`` pairs.  Cost is O(garbage
+            freed), not O(heap), so unlike :attr:`top_objects` this is cheap
+            enough for long runs.  While active the monitor owns
+            ``gc.garbage``: it drains the list after every collection.
     """
 
     enabled: bool = False
     min_pause_ms: float = 1.0
     top_objects: int = 0
+    top_cycles: int = 0
 
     def __post_init__(self) -> None:
         if self.min_pause_ms < 0.0:
             raise ValueError(f"min_pause_ms must be >= 0; got {self.min_pause_ms}")
         if self.top_objects < 0:
             raise ValueError(f"top_objects must be >= 0; got {self.top_objects}")
+        if self.top_cycles < 0:
+            raise ValueError(f"top_cycles must be >= 0; got {self.top_cycles}")
 
 
 class GCMonitor:
@@ -68,25 +80,42 @@ class GCMonitor:
         self._installed = False
         self._start_ns = 0
         self._top_objects = ""
+        self._prev_gc_debug = 0
 
     def install(self) -> None:
-        """Start timing collections.  Idempotent."""
+        """Start timing collections.  Idempotent.
+
+        When cycle diagnostics are configured this also sets
+        ``gc.DEBUG_SAVEALL``, so freed cyclic garbage is routed through
+        ``gc.garbage`` where the hook can classify it before draining it.
+        """
         if self._installed:
             return
+        if self._config.top_cycles > 0:
+            self._prev_gc_debug = gc.get_debug()
+            gc.set_debug(self._prev_gc_debug | gc.DEBUG_SAVEALL)
         gc.callbacks.append(self._on_gc)
         self._installed = True
         logger.info(
-            "GC monitor on (min_pause=%.1fms, top_objects=%d)",
+            "GC monitor on (min_pause=%.1fms, top_objects=%d, top_cycles=%d)",
             self._config.min_pause_ms,
             self._config.top_objects,
+            self._config.top_cycles,
         )
 
     def uninstall(self) -> None:
-        """Stop timing collections.  Idempotent."""
+        """Stop timing collections.  Idempotent.
+
+        Restores the pre-install ``gc.set_debug`` flags and drains any
+        garbage still parked by ``gc.DEBUG_SAVEALL``.
+        """
         if not self._installed:
             return
         if self._on_gc in gc.callbacks:
             gc.callbacks.remove(self._on_gc)
+        if self._config.top_cycles > 0:
+            gc.set_debug(self._prev_gc_debug)
+            del gc.garbage[:]
         self._installed = False
         logger.info("GC monitor off")
 
@@ -118,16 +147,21 @@ class GCMonitor:
         duration_ms = (time.monotonic_ns() - self._start_ns) / 1e6
         top_objects = self._top_objects
         self._top_objects = ""
+        # Drain unconditionally: DEBUG_SAVEALL parks garbage on every
+        # collection, so skipping the drain for below-threshold collections
+        # would leak.
+        top_cycles = self._drain_cycles()
         if duration_ms < self._config.min_pause_ms:
             return
 
         logger.info(
-            "GC gen%d %.1fms collected=%d uncollectable=%d%s",
+            "GC gen%d %.1fms collected=%d uncollectable=%d%s%s",
             generation,
             duration_ms,
             info.get("collected", 0),
             info.get("uncollectable", 0),
             f" {top_objects}" if top_objects else "",
+            f" {top_cycles}" if top_cycles else "",
         )
 
     def _compute_top_objects(self, generation: int) -> str:
@@ -138,6 +172,27 @@ class GCMonitor:
         counts = Counter(_type_name(o) for o in gc.get_objects(generation))
         return " ".join(
             f"{type_name}={count}" for type_name, count in counts.most_common(top)
+        )
+
+    def _drain_cycles(self) -> str:
+        """Classify and drain the cyclic garbage parked by ``DEBUG_SAVEALL``.
+
+        Returns:
+            A one-line ``cycle:type=count`` breakdown of the most common
+            types in ``gc.garbage``, or ``""`` when cycle diagnostics are
+            off or nothing was freed.  Draining drops the last references,
+            so the garbage is actually released here.
+        """
+        if self._config.top_cycles <= 0:
+            return ""
+        garbage = gc.garbage
+        if not garbage:
+            return ""
+        counts = Counter(_type_name(o) for o in garbage)
+        del garbage[:]
+        return " ".join(
+            f"cycle:{type_name}={count}"
+            for type_name, count in counts.most_common(self._config.top_cycles)
         )
 
 

@@ -241,6 +241,16 @@ def add_observability_args(
         "collection and can itself cost hundreds of milliseconds on a large "
         "cache. Default is 0 (off); use only while debugging.",
     )
+    gc_group.add_argument(
+        "--gc-monitor-top-cycles",
+        type=int,
+        default=0,
+        help="Include a breakdown (cycle:type=count) of the N most common "
+        "object types among the cyclic garbage each collection actually "
+        "freed, identifying the code that creates reference cycles. Runs "
+        "the collector with gc.DEBUG_SAVEALL; cost is proportional to the "
+        "garbage freed, not to the heap. Default is 0 (off).",
+    )
 
     extra_group = parser.add_argument_group(
         "Extra Logging",
@@ -317,6 +327,7 @@ def parse_args_to_observability_config(
             enabled=args.enable_gc_monitor,
             min_pause_ms=args.gc_monitor_min_pause_ms,
             top_objects=args.gc_monitor_top_objects,
+            top_cycles=args.gc_monitor_top_cycles,
         ),
         extra_logging_enabled=args.enable_extra_logging,
         extra_logging_interval=args.extra_logging_interval,

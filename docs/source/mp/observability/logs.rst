@@ -56,6 +56,14 @@ Notes:
 - ``--gc-monitor-top-objects`` shows *what* the collector is walking, but
   scans the whole generation on **every** collection (O(heap), can itself
   cost hundreds of ms). Debugging only.
+- ``--gc-monitor-top-cycles`` appends a ``cycle:type=count`` breakdown of
+  the cyclic garbage each collection actually freed::
+
+      GC gen2 173.2ms collected=39 uncollectable=0 cycle:builtins.cell=20 cycle:builtins.function=8
+
+  The module-qualified type names point at the code creating reference
+  cycles. Implemented via ``gc.DEBUG_SAVEALL``; cost is proportional to the
+  garbage freed, not to the heap, so it is cheap enough for long runs.
 - Non-zero ``uncollectable`` means CPython found garbage it could not free —
   a reference-cycle leak worth chasing.
 - The monitor logs directly instead of publishing events, so it is
