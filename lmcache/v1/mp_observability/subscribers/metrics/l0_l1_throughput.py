@@ -14,9 +14,16 @@ Implementation:
     because one MP server process serves multiple vLLM workers, so TP/PP
     replicas of the same request fire concurrent START/END pairs on
     different GPUs.
-  - START/END events fire on the GPU cupy stream (``publish_on_stream``),
-    so their timestamps reflect true GPU-stream time for the D2H/H2D
-    copies — not Python/lock overhead.
+  - START/END events fire on the GPU cupy stream (``publish_on_stream``).
+    The store histogram includes the CPU ``reserve_write`` share (it runs
+    after MP_STORE_START is on the stream); subtract
+    ``l0_l1_store_reserve_time`` to isolate GPU time.
+
+Also emitted from MP_STORE_END metadata:
+  - ``lmcache_mp.l0_l1_store_reserve_time``       — CPU reserve time (s)
+  - ``lmcache_mp.l0_l1_store_skipped_ratio``      — skipped/total objects
+  - ``lmcache_mp.l0_l1_store_longest_skip_free_run`` — longest contiguous
+    non-skipped run (objects)
 """
 
 # Future
@@ -62,6 +69,32 @@ class L0L1ThroughputSubscriber(EventSubscriber):
             ),
             unit="GB/s",
         )
+        self._reserve_hist = meter.create_histogram(
+            "lmcache_mp.l0_l1_store_reserve_time",
+            description=(
+                "Histogram of per-store CPU time spent in "
+                "storage_manager.reserve_write (locks + allocation). This "
+                "share is included in the store throughput denominator."
+            ),
+            unit="s",
+        )
+        self._skipped_ratio_hist = meter.create_histogram(
+            "lmcache_mp.l0_l1_store_skipped_ratio",
+            description=(
+                "Histogram of the per-store fraction of chunk objects the "
+                "storage manager skipped (already cached / no space)."
+            ),
+            unit="1",
+        )
+        self._skip_free_run_hist = meter.create_histogram(
+            "lmcache_mp.l0_l1_store_longest_skip_free_run",
+            description=(
+                "Histogram of the per-store longest contiguous run of "
+                "non-skipped chunk objects. Bounds the achievable store "
+                "batch size."
+            ),
+            unit="1",
+        )
 
     # -- EventSubscriber interface -----------------------------------------
 
@@ -86,6 +119,43 @@ class L0L1ThroughputSubscriber(EventSubscriber):
             pending=self._pending_store,
             hist=self._store_hist,
         )
+        self._record_store_side_stats(event)
+
+    def _record_store_side_stats(self, event: Event) -> None:
+        """Record the reserve-time and skip-run stats an END event carries.
+
+        Older publishers omit these metadata fields; each metric is skipped
+        independently when its field is absent or degenerate.
+        """
+        attrs = self._store_stat_attributes(event)
+        reserve_seconds = event.metadata.get("reserve_seconds")
+        if reserve_seconds is not None and reserve_seconds >= 0:
+            self._reserve_hist.record(reserve_seconds, attributes=attrs)
+
+        objects_total = event.metadata.get("objects_total", 0)
+        if objects_total > 0:
+            objects_skipped = event.metadata.get("objects_skipped", 0)
+            self._skipped_ratio_hist.record(
+                objects_skipped / objects_total, attributes=attrs
+            )
+            self._skip_free_run_hist.record(
+                event.metadata.get("longest_skip_free_run", 0), attributes=attrs
+            )
+
+    @staticmethod
+    def _store_stat_attributes(event: Event) -> dict[str, Any]:
+        """Build the label set shared by the store-side stat histograms."""
+        attrs: dict[str, Any] = {}
+        device = event.metadata.get("device")
+        if device is not None:
+            attrs["device"] = str(device)
+        engine_id = event.metadata.get("engine_id")
+        if engine_id is not None:
+            attrs["engine_id"] = str(engine_id)
+        model_name = event.metadata.get("model_name")
+        if model_name is not None:
+            attrs["model_name"] = str(model_name)
+        return attrs
 
     # -- Retrieve path (L1→L0, CPU→GPU) ------------------------------------
 

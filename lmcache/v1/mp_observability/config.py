@@ -60,6 +60,11 @@ class ObservabilityConfig:
     """Fraction of chunks/blocks to track for lifecycle histograms (0, 1.0].
     Counters always count all events regardless of this setting."""
 
+    phase_timing_enabled: bool = True
+    """Record gather/DMA phase timings (CUDA event pairs) in the native plan
+    executor. Effective only when ``enabled`` and ``metrics_enabled`` also
+    hold; the resolved value is pushed to the native layer at startup."""
+
     lookup_hash_log: LookupHashLogConfig = field(default_factory=LookupHashLogConfig)
     """Configuration for lookup hash file logging.  Disabled by default
     (empty ``output_dir``)."""
@@ -127,6 +132,13 @@ def add_observability_args(
         action="store_true",
         default=False,
         help="Disable metrics subscribers (OTel counters).",
+    )
+    group.add_argument(
+        "--disable-phase-timing",
+        action="store_true",
+        default=False,
+        help="Disable gather/DMA phase timing (CUDA event pairs) in the "
+        "native transfer executor.",
     )
     group.add_argument(
         "--disable-logging",
@@ -307,6 +319,7 @@ def parse_args_to_observability_config(
         otlp_endpoint=args.otlp_endpoint,
         prometheus_port=args.prometheus_port,
         metrics_sample_rate=args.metrics_sample_rate,
+        phase_timing_enabled=not args.disable_phase_timing,
         lookup_hash_log=LookupHashLogConfig(
             output_dir=args.lookup_hash_log_dir,
             rotation_interval_sec=args.lookup_hash_log_rotation_interval,
@@ -340,6 +353,26 @@ def parse_args_to_observability_config(
         raise ValueError("--extra-logging-interval must be > 0.")
 
     return config
+
+
+def _push_phase_timing_enabled(enabled: bool) -> None:
+    """Push the resolved phase-timing switch to the native plan executor.
+
+    No-op when the compiled extension is unavailable or predates the
+    ``set_phase_timing_enabled`` op.
+
+    Args:
+        enabled: Whether the executor should record gather/DMA CUDA event
+            pairs; resolved from :class:`ObservabilityConfig`.
+    """
+    try:
+        # First Party
+        import lmcache.c_ops as lmc_ops
+    except ImportError:
+        return
+    setter = getattr(lmc_ops, "set_phase_timing_enabled", None)
+    if setter is not None:
+        setter(enabled)
 
 
 def init_observability(
@@ -400,6 +433,12 @@ def init_observability(
         )
     )
 
+    _push_phase_timing_enabled(
+        obs_config.enabled
+        and obs_config.metrics_enabled
+        and obs_config.phase_timing_enabled
+    )
+
     if obs_config.metrics_enabled:
         # First Party
         from lmcache.v1.mp_observability.subscribers.metrics import (
@@ -418,6 +457,7 @@ def init_observability(
             LookupMetricsSubscriber,
             SMLifecycleSubscriber,
             TimeoutMetricsSubscriber,
+            TransferPhaseSubscriber,
         )
 
         sample_rate = obs_config.metrics_sample_rate
@@ -436,6 +476,7 @@ def init_observability(
         bus.register_subscriber(EngineMetricsSubscriber())
         bus.register_subscriber(EventBusSelfMetricsSubscriber(bus))
         bus.register_subscriber(TimeoutMetricsSubscriber())
+        bus.register_subscriber(TransferPhaseSubscriber())
 
     if obs_config.logging_enabled:
         # First Party

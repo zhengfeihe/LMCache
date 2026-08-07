@@ -6,6 +6,7 @@
 
 #include <c10/cuda/CUDAGuard.h>
 #include <cstdint>
+#include <tuple>
 #include <vector>
 
 struct PageBufferShapeDesc {
@@ -114,6 +115,38 @@ struct KernelGroupSpec {
   int64_t block_ids_capacity;  // total int64 elements behind block_ids_base;
                                // bounds-checks each slice in the executor
 };
+
+// Timed sections of execute_object_group_transfer, reported by
+// harvest_transfer_phase_timings().
+enum class TransferPhase : int {
+  KERNEL = 0,   // gather/scatter kernel launches (paged blocks <-> staging)
+  STAGING = 1,  // host<->device DMA staging copies
+};
+
+/**
+ * Enable or disable phase-timing recording in the plan executor.
+ *
+ * Defaults to enabled; pushed from the observability config at startup.
+ * Thread-safe; takes effect for subsequently executed plans.
+ *
+ * @param enabled  Whether execute_object_group_transfer records CUDA
+ *                 event pairs around its kernel/staging sections.
+ */
+void set_phase_timing_enabled(bool enabled);
+
+/**
+ * Drain completed gather/DMA phase timing samples.
+ *
+ * Returns the finished CUDA event pairs recorded by
+ * execute_object_group_transfer; unfinished pairs stay queued.
+ *
+ * @return One tuple per finished section:
+ *         (phase, direction, device_index, elapsed_ms, nbytes), with phase a
+ *         TransferPhase value, direction a TransferDirection value, and
+ *         nbytes the step's staged payload (shared by both phases).
+ */
+std::vector<std::tuple<int, int, int, double, int64_t>>
+harvest_transfer_phase_timings();
 
 /**
  * Execute one object group's transfer plan on the current CUDA stream.

@@ -32,6 +32,7 @@ from lmcache.v1.kv_layer_groups import ObjectGroupInfo
 from lmcache.v1.memory_allocators.lazy_memory_allocator import LazyMemoryAllocator
 from lmcache.v1.memory_management import GDSMemoryObject, MemoryObj
 from lmcache.v1.mp_observability.event import Event, EventType
+from lmcache.v1.mp_observability.event_bus import EventBus
 from lmcache.v1.multiprocess.custom_types import (
     IPCCacheServerKey,
     KVCache,
@@ -60,6 +61,7 @@ logger = init_logger(__name__)
 _HAS_NATIVE_OBJECT_GROUP_TRANSFER: bool = hasattr(
     lmc_ops, "execute_object_group_transfer"
 )
+_HAS_PHASE_TIMING_HARVEST: bool = hasattr(lmc_ops, "harvest_transfer_phase_timings")
 
 
 def get_layout_desc(
@@ -278,6 +280,58 @@ def _recalculate_blocks_to_skip(
     tail_blocks = blocks_to_skip % blocks_per_chunk
     tail_blocks_to_skip = tail_blocks - (blocks_per_chunk - blocks_per_window)
     return full_windows_to_skip * blocks_per_window + max(0, tail_blocks_to_skip)
+
+
+def summarize_skip_runs(
+    memory_objs: Sequence[MemoryObj | None],
+) -> tuple[int, int, int]:
+    """Summarize storage-manager skips (``None`` entries) in a store batch.
+
+    Args:
+        memory_objs: Reserved objects for one object group in chunk order;
+            ``None`` marks a chunk the storage manager skipped.
+
+    Returns:
+        A tuple ``(total, skipped, longest_run)``: the number of entries,
+        the number of ``None`` entries, and the length of the longest
+        contiguous run without a ``None``.
+    """
+    total = len(memory_objs)
+    skipped = 0
+    longest_run = 0
+    current_run = 0
+    for memory_obj in memory_objs:
+        if memory_obj is None:
+            skipped += 1
+            current_run = 0
+        else:
+            current_run += 1
+            longest_run = max(longest_run, current_run)
+    return total, skipped, longest_run
+
+
+def harvest_and_publish_phase_timings(event_bus: EventBus) -> None:
+    """Drain finished gather/DMA phase timings and publish them on the bus.
+
+    Samples complete asynchronously and belong to transfers enqueued
+    earlier, so publication is decoupled from any single request. No-op
+    when the native op is unavailable or nothing has finished.
+
+    Args:
+        event_bus: Bus that receives the ``MP_TRANSFER_PHASE_SAMPLES``
+            event; see the ``EventType`` docstring for the metadata layout.
+    """
+    if not _HAS_PHASE_TIMING_HARVEST:
+        return
+    samples = lmc_ops.harvest_transfer_phase_timings()
+    if not samples:
+        return
+    event_bus.publish(
+        Event(
+            event_type=EventType.MP_TRANSFER_PHASE_SAMPLES,
+            metadata={"samples": samples},
+        )
+    )
 
 
 def _run_object_group_transfer_plan(
@@ -1140,6 +1194,10 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             all_dict: dict[ObjectKey, MemoryObj] = {}
             total_bytes: int = 0
             store_succeeded = False
+            reserve_seconds: float = 0.0
+            objects_total: int = 0
+            objects_skipped: int = 0
+            longest_skip_free_run: int = 0
             try:
                 for obj_group_id in range(num_object_groups):
                     obj_keys = obj_keys_per_obj_group[obj_group_id]
@@ -1152,9 +1210,12 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                         self._ctx.chunk_size,
                         object_group_id=obj_group_id,
                     )
+                    # CPU share included in the stream-clocked store metric.
+                    reserve_start = time.perf_counter()
                     reserved_dict = self._ctx.storage_manager.reserve_write(
                         keys_to_reserve, layout_desc, "new"
                     )
+                    reserve_seconds += time.perf_counter() - reserve_start
                     all_dict.update(reserved_dict)
                     if reserved_dict:
                         total_bytes += next(
@@ -1167,6 +1228,14 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                     memory_objs: list[MemoryObj | None] = [
                         reserved_dict.get(obj_key) for obj_key in obj_keys
                     ]
+                    group_total, group_skipped, group_longest_run = summarize_skip_runs(
+                        memory_objs
+                    )
+                    objects_total += group_total
+                    objects_skipped += group_skipped
+                    longest_skip_free_run = max(
+                        longest_skip_free_run, group_longest_run
+                    )
 
                     # NOTE: batch_size must stay 1 for store.
                     transfer_kv_per_object_group(
@@ -1208,10 +1277,15 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                             "model_name": model_name,
                             "total_bytes": total_bytes,
                             "num_tokens": num_tokens,
+                            "reserve_seconds": reserve_seconds,
+                            "objects_total": objects_total,
+                            "objects_skipped": objects_skipped,
+                            "longest_skip_free_run": longest_skip_free_run,
                         },
                     ),
                 )
 
+        harvest_and_publish_phase_timings(self._ctx.event_bus)
         ed = time.perf_counter()
         if stored_count:
             logger.info(
@@ -1420,6 +1494,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                         },
                     ),
                 )
+        harvest_and_publish_phase_timings(self._ctx.event_bus)
         if retrieve_succeeded:
             tokens_retrieved = num_chunks * self._ctx.chunk_size
             ed = time.perf_counter()
