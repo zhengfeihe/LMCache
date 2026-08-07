@@ -40,6 +40,29 @@ from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.mp_observability.event_bus import EventCallback, EventSubscriber
 
 
+def _as_number(value: Any) -> float | None:
+    """Coerce an event-metadata value to a number, or None if it isn't one.
+
+    Events published via ``EventBus.publish_on_stream`` cross into C++ through
+    ``record_event_on_stream``, whose only typed containers are ``map<str,str>``
+    and ``map<str,int>``. Anything that is not an ``int`` -- notably every
+    ``float`` -- is coerced with ``str(v)`` on the way out and comes back as a
+    string, so numeric metadata must be parsed rather than compared directly.
+    Values arriving over the in-process path keep their original type, so this
+    has to accept both.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 class L0L1ThroughputSubscriber(EventSubscriber):
     """Records L0↔L1 throughput by correlating MP_*_START→MP_*_END pairs."""
 
@@ -128,18 +151,19 @@ class L0L1ThroughputSubscriber(EventSubscriber):
         independently when its field is absent or degenerate.
         """
         attrs = self._store_stat_attributes(event)
-        reserve_seconds = event.metadata.get("reserve_seconds")
+        reserve_seconds = _as_number(event.metadata.get("reserve_seconds"))
         if reserve_seconds is not None and reserve_seconds >= 0:
             self._reserve_hist.record(reserve_seconds, attributes=attrs)
 
-        objects_total = event.metadata.get("objects_total", 0)
+        objects_total = _as_number(event.metadata.get("objects_total")) or 0.0
         if objects_total > 0:
-            objects_skipped = event.metadata.get("objects_skipped", 0)
+            objects_skipped = _as_number(event.metadata.get("objects_skipped")) or 0.0
             self._skipped_ratio_hist.record(
                 objects_skipped / objects_total, attributes=attrs
             )
             self._skip_free_run_hist.record(
-                event.metadata.get("longest_skip_free_run", 0), attributes=attrs
+                _as_number(event.metadata.get("longest_skip_free_run")) or 0.0,
+                attributes=attrs,
             )
 
     @staticmethod
