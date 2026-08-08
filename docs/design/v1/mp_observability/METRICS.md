@@ -288,11 +288,12 @@ per-worker, per-device, and per-model slicing in Prometheus (e.g.
 achieving for KV store/load? Does it match the theoretical PCIe bandwidth?
 Are some workers or GPUs underperforming?
 
-**Caveats:** the store throughput denominator starts at `MP_STORE_START`,
-which is enqueued before `reserve_write` runs on the CPU — subtract
-`l0_l1_store_reserve_time` to isolate GPU time.  The skip metrics bound
-the payoff of batching stores: batches can only span contiguous
-non-skipped chunks.
+**Caveats:** the store path publishes `MP_STORE_START` only after
+`reserve_write` completes for every object group, so the throughput
+denominator covers enqueued GPU work; the CPU share is reported
+separately as `l0_l1_store_reserve_time`.  The skip metrics bound the
+payoff of batching stores: batches can only span contiguous non-skipped
+chunks.
 
 ---
 

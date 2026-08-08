@@ -15,9 +15,9 @@ Implementation:
     replicas of the same request fire concurrent START/END pairs on
     different GPUs.
   - START/END events fire on the GPU cupy stream (``publish_on_stream``).
-    The store histogram includes the CPU ``reserve_write`` share (it runs
-    after MP_STORE_START is on the stream); subtract
-    ``l0_l1_store_reserve_time`` to isolate GPU time.
+    The store path publishes START only after ``reserve_write`` completes
+    for every object group, so the window covers enqueued GPU work; the
+    CPU share is reported separately as ``l0_l1_store_reserve_time``.
 
 Also emitted from MP_STORE_END metadata:
   - ``lmcache_mp.l0_l1_store_reserve_time``       — CPU reserve time (s)

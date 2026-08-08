@@ -1177,19 +1177,6 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             ):
                 self._publish_token_bindings(key, obj_keys_per_obj_group[0])
 
-            self._ctx.event_bus.publish_on_stream(
-                cache_context.cupy_stream,
-                Event(
-                    event_type=EventType.MP_STORE_START,
-                    session_id=key.request_id,
-                    metadata={
-                        "device": str(cache_context.device),
-                        "engine_id": instance_id,
-                        "model_name": model_name,
-                    },
-                ),
-            )
-
             reserved_dict: dict[ObjectKey, MemoryObj] = {}
             all_dict: dict[ObjectKey, MemoryObj] = {}
             total_bytes: int = 0
@@ -1199,6 +1186,10 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             objects_skipped: int = 0
             longest_skip_free_run: int = 0
             try:
+                # CPU phase: reserve every object group before the START
+                # marker goes onto the stream, so the stream-clocked window
+                # contains only enqueued GPU work.
+                group_plans: list[tuple[int, list[MemoryObj | None]]] = []
                 for obj_group_id in range(num_object_groups):
                     obj_keys = obj_keys_per_obj_group[obj_group_id]
                     skip_mask = skipped_chunks[obj_group_id]
@@ -1210,7 +1201,6 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                         self._ctx.chunk_size,
                         object_group_id=obj_group_id,
                     )
-                    # CPU share included in the stream-clocked store metric.
                     reserve_start = time.perf_counter()
                     reserved_dict = self._ctx.storage_manager.reserve_write(
                         keys_to_reserve, layout_desc, "new"
@@ -1236,7 +1226,23 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                     longest_skip_free_run = max(
                         longest_skip_free_run, group_longest_run
                     )
+                    group_plans.append((obj_group_id, memory_objs))
 
+                self._ctx.event_bus.publish_on_stream(
+                    cache_context.cupy_stream,
+                    Event(
+                        event_type=EventType.MP_STORE_START,
+                        session_id=key.request_id,
+                        metadata={
+                            "device": str(cache_context.device),
+                            "engine_id": instance_id,
+                            "model_name": model_name,
+                        },
+                    ),
+                )
+
+                # GPU phase: enqueue every group's transfers back to back.
+                for obj_group_id, memory_objs in group_plans:
                     # NOTE: batch_size must stay 1 for store.
                     transfer_kv_per_object_group(
                         cache_context,
