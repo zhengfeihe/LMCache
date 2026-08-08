@@ -2,6 +2,7 @@
 
 #include "mp_mem_kernels.cuh"
 
+#include <algorithm>
 #include <atomic>
 #include <deque>
 #include <functional>
@@ -292,7 +293,8 @@ __device__ void multi_layer_block_transfer_single_block(
     return;
   }
 
-  for (int token_offset = 0; token_offset < shape_desc.bs; ++token_offset) {
+  for (int token_offset = threadIdx.z; token_offset < shape_desc.bs;
+       token_offset += blockDim.z) {
     const size_t engine_local_offset =
         calculate_engine_local_offset<ScalarType, format>(token_offset,
                                                           head_idx, shape_desc);
@@ -449,8 +451,15 @@ void multi_layer_block_kv_transfer_templated(
                           static_cast<int>(sizeof(ScalarType));
   int thread_dim_x = std::min(elements_per_head, 32);
   int thread_dim_y = shape_desc.nh;
+  // Low kv_size * nh shapes (MLA, linear-layer views) leave the block at a
+  // warp or less; parallelize the token loop on z to fill the block up to
+  // ~kTargetBlockThreads. Shapes that already fill it keep z == 1.
+  constexpr int kTargetBlockThreads = 128;
+  int thread_dim_z = std::min(
+      {shape_desc.bs, kTargetBlockThreads / (thread_dim_x * thread_dim_y), 64});
+  thread_dim_z = std::max(thread_dim_z, 1);
 
-  dim3 block(thread_dim_x, thread_dim_y);
+  dim3 block(thread_dim_x, thread_dim_y, thread_dim_z);
   dim3 grid(shape_desc.kv_size, total_blocks, shape_desc.nl);
 
   if (direction == TransferDirection::H2D) {
