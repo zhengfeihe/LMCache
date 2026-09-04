@@ -63,6 +63,8 @@ class _SpecKind(Enum):
     SINK_FULL_ATTENTION = "sink_full_attention"
     CROSS_ATTENTION = "cross_attention"
     MAMBA = "mamba"
+    # Added on dev after this PR was opened (_SubpagedMLAAttentionViewEdit).
+    MLA_ATTENTION = "mla_attention"
 
 
 @dataclass
