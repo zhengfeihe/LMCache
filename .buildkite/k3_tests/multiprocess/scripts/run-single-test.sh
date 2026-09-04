@@ -72,6 +72,9 @@ elif [ "$TEST_NAME" = "hma_probe_qwen3_5" ]; then
     # GDN supports only the 'align' Mamba cache mode.
     export MAMBA_CACHE_MODE="${MAMBA_CACHE_MODE:-align}"
     export MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-544}"
+    # GDN has no batch-invariant kernels: the launcher's default of 1 aborts
+    # vLLM with "batch_invariant mode is not supported for GDN_ATTN".
+    export BATCH_INVARIANT="${BATCH_INVARIANT:-0}"
 elif [ "$TEST_NAME" = "kimi_linear_tp" ]; then
     # Self-contained test: run-kimi-linear-tp.sh owns the server lifecycle and
     # all launch flags (TP=2, trust-remote-code, align, chunk/batch sizes). Only

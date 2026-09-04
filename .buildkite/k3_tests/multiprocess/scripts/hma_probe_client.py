@@ -1,17 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Send the HMA probe request and save the completion for comparison.
+"""Send one HMA probe request and save the completion for comparison.
 
-The probe is one deterministic long-prefix request: a numbered list of rules,
-each embedding a unique codeword, followed by a question that can only be
-answered by reading codewords back out of the prefix. Both probe phases (the
-store run and the LMCache-served hit run) send the byte-identical request at
-temperature 0 with a single in-flight request, so the two completions must
-match exactly when the retrieved KV is faithful; corrupted attention KV shows
-up as a wrong or missing codeword.
+The prompt is a numbered list of rules, each embedding a unique codeword,
+followed by a question answerable only by reading codewords back out of the
+prefix -- so a faithful answer requires attention over the whole cached
+prefix, and corrupted KV shows up as a wrong or missing codeword. Requests go
+to /v1/completions at temperature 0, so a given prompt has one correct
+continuation.
 
-The caller (run-hma-probe.sh) is responsible for resetting vLLM's local
-prefix cache between the two phases and for asserting that the hit phase was
-actually served by LMCache.
+run-hma-probe.sh owns the phase protocol: which prompts to send, when to
+reset vLLM's local prefix cache, and which completions to compare.
 """
 
 # Standard
@@ -28,6 +26,12 @@ QUESTION = (
     "\n\nQuestion: List the secret codewords of rules 3, 17, and 41, "
     "one per line."
 )
+# Qwen3.5 opens a <think> reasoning block by default, which would fill the
+# completion with a preamble instead of the codewords the probe compares.
+# /v1/completions applies no chat template, so close the block in the prompt
+# ourselves -- byte-identical to what the model's own chat template emits for
+# enable_thinking=false (chat_template.jinja: '<think>\n\n</think>\n\n').
+THINK_OFF = "\n\n<think>\n\n</think>\n\n"
 
 
 def build_prompt(num_rules: int) -> str:
@@ -44,7 +48,7 @@ def build_prompt(num_rules: int) -> str:
     prefix = "You are a careful assistant.\n" + "\n".join(
         RULE_TEMPLATE % (i, i, i) for i in range(num_rules)
     )
-    return prefix + QUESTION
+    return prefix + QUESTION + THINK_OFF
 
 
 def send_probe(port: int, model: str, prompt: str, max_tokens: int) -> str:
@@ -92,7 +96,7 @@ def main() -> int:
     parser.add_argument("--model", required=True)
     parser.add_argument("--out", required=True, help="File to write the text to")
     parser.add_argument("--num-rules", type=int, default=60)
-    parser.add_argument("--max-tokens", type=int, default=48)
+    parser.add_argument("--max-tokens", type=int, default=160)
     parser.add_argument(
         "--cut-at-rule",
         type=int,
