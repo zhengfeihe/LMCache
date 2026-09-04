@@ -103,6 +103,35 @@ if [ -n "${MAX_NUM_BATCHED_TOKENS:-}" ]; then
     MAX_NUM_BATCHED_TOKENS_ARG="--max-num-batched-tokens ${MAX_NUM_BATCHED_TOKENS}"
 fi
 
+# Tensor parallelism. Default 1: every test using this shared launcher is
+# single-GPU today (the TP tests -- kimi_linear_tp, dsv4_flash_tp -- own their
+# own launch scripts). Raising it needs as many visible GPUs, and MAX_WORKERS
+# must be >= TP so the MP server has a worker slot per rank: with fewer slots
+# the ranks silently serve zero external hits, which reads as a green run that
+# never exercised LMCache at all (LMCache #4247).
+TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
+TENSOR_PARALLEL_ARG=""
+if [ "$TENSOR_PARALLEL_SIZE" != "1" ]; then
+    TENSOR_PARALLEL_ARG="--tensor-parallel-size ${TENSOR_PARALLEL_SIZE}"
+    if [ "$MAX_WORKERS" -lt "$TENSOR_PARALLEL_SIZE" ]; then
+        echo "MAX_WORKERS=${MAX_WORKERS} is below TP=${TENSOR_PARALLEL_SIZE};" \
+             "raising it so every rank gets a worker slot"
+        MAX_WORKERS="$TENSOR_PARALLEL_SIZE"
+    fi
+fi
+
+# Speculative decoding. Empty -> off (the default for every existing test).
+# Set NUM_SPECULATIVE_TOKENS to enable the model's own MTP draft modules; the
+# method is model-specific, so SPECULATIVE_METHOD selects it. Every reported
+# ext > 0 hybrid corruption (LMCache #4247) ran with speculative decoding on,
+# and its signature is a collapsing draft-acceptance rate, so probes chasing
+# that class need the draft/verify loop the other tests deliberately omit.
+SPECULATIVE_ARG=""
+if [ -n "${NUM_SPECULATIVE_TOKENS:-}" ]; then
+    SPECULATIVE_ARG="--speculative-config {\"method\":\"${SPECULATIVE_METHOD:-qwen3_5_mtp}\",\"num_speculative_tokens\":${NUM_SPECULATIVE_TOKENS}}"
+    echo "Speculative decoding enabled: ${SPECULATIVE_ARG}"
+fi
+
 # Split kernel groups into one object group per sliding-window size at
 # KV-cache registration. Required for hybrid models (e.g. gemma-4's
 # sliding-window + full-attention groups have different block sizes); without
@@ -244,6 +273,8 @@ vllm serve "$MODEL" \
     $MAMBA_ARGS \
     $PREFIX_CACHING_ARG \
     $MAX_NUM_BATCHED_TOKENS_ARG \
+    $SPECULATIVE_ARG \
+    $TENSOR_PARALLEL_ARG \
     > "/tmp/build_${BUILD_ID}_vllm.log" 2>&1 &
 
 VLLM_PID=$!

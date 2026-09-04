@@ -48,6 +48,10 @@ VLLM_PORT="${VLLM_PORT:-8000}"
 MODEL="${MODEL:-Qwen/Qwen3.5-0.8B}"
 # Prefix length in rules; 60 rules is ~2.5k tokens, several 544-token chunks.
 NUM_RULES="${NUM_RULES:-60}"
+# Rule index the mixed-phase warmup truncates at: it fixes how much of the
+# prefix vLLM's APC holds locally, and so the local/external split the mixed
+# phase composes. Must be < NUM_RULES.
+CUT_AT_RULE="${CUT_AT_RULE:-30}"
 # Seconds to let async LMCache stores drain before the hit phase.
 STORE_DRAIN_SECONDS="${STORE_DRAIN_SECONDS:-10}"
 BUILD_ID="${BUILD_ID:-local_$$}"
@@ -61,7 +65,7 @@ mkdir -p "$PROBE_DIR"
 echo "=== HMA transfer-faithfulness probe ==="
 echo "Model: $MODEL"
 echo "vLLM (LMCache) port: $VLLM_PORT"
-echo "Rules in prefix: $NUM_RULES"
+echo "Rules in prefix: $NUM_RULES (mixed-phase warmup cuts at rule $CUT_AT_RULE)"
 echo "Results dir: $PROBE_DIR"
 echo ""
 
@@ -136,7 +140,7 @@ echo ""
 echo "=== Warmup (truncated strict prefix; APC holds only leading blocks) ==="
 python "${SCRIPT_DIR}/hma_probe_client.py" \
     --port "$VLLM_PORT" --model "$MODEL" --num-rules "$NUM_RULES" \
-    --cut-at-rule 30 --max-tokens 4 --out "$PROBE_DIR/warmup.txt"
+    --cut-at-rule "$CUT_AT_RULE" --max-tokens 4 --out "$PROBE_DIR/warmup.txt"
 echo ""
 
 retrieves_before=$(count_retrieves)
